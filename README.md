@@ -106,16 +106,13 @@ vault write spiffe/role/role-chatbot \
     use_jti_claim=true
 ```
 
-### 5. Publish the SPIFFE OIDC discovery endpoints
-
-Relying parties verify the JWT using Vault's JWKS:
+Vault publishes the SPIFFE OIDC discovery and JWKS endpoints automatically
+once `jwt_issuer_url` is set in step 3 — no extra command is required.
+Verify they're live:
 
 ```bash
-vault write identity/oidc/config issuer="$ISSUER"
-
-# Discovery URL: $ISSUER/.well-known/openid-configuration
-# JWKS URL:      $ISSUER/.well-known/keys
-curl -s "$ISSUER/.well-known/keys"
+curl -s "$ISSUER/.well-known/openid-configuration" | jq .
+curl -s "$ISSUER/.well-known/keys"                 | jq .
 ```
 
 At this point the agent identity is fully bootstrapped: any pod matching
@@ -124,7 +121,7 @@ verifiable by anything that trusts `$ISSUER`.
 
 ## Inbound JWT Auth (User OBO)
 
-### 6. Configure the inbound JWT auth method
+### 5. Configure the inbound JWT auth method
 
 Lets Vault accept user identity tokens from the IdP (IBM Verify) so the
 chatbot can perform on-behalf-of token exchange.
@@ -160,7 +157,7 @@ EOF
 
 ## Testing
 
-### 7. Test the JWT login
+### 6. Test the JWT login
 
 End-to-end smoke test: mint a SPIFFE JWT, decode its claims, then log in
 to the JWT auth method and confirm the returned token carries
