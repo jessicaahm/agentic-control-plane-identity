@@ -136,19 +136,140 @@ vault write auth/jwt/config \
     oidc_discovery_url="https://test-demo-2020.verify.ibm.com/oidc/endpoint/default" \
     bound_issuer="https://test-demo-2020.verify.ibm.com/oidc/endpoint/default"
 
-vault write auth/jwt/role/chatbot-role \
-    role_type="jwt" \
-    policies="chatbot-policy" \
-    user_claim="sub" \
-    bound_audiences="vault" \
-    bound_claims_type="glob" \
-    bound_claims='{"sub":"spiffe://example.org/ns/chatbot/*"}' \
-    token_ttl=1h \
-    token_max_ttl=4h
+cat <<'EOF' | vault write auth/jwt/role/chatbot-role -
+{
+  "role_type": "jwt",
+  "policies": "chatbot-policy",
+  "user_claim": "sub",
+  "bound_audiences": "vault",
+  "bound_claims_type": "glob",
+  "bound_claims": { "sub": "spiffe://example.org/ns/chatbot/*" },
+  "token_ttl": "1h",
+  "token_max_ttl": "4h"
+}
+EOF
 ```
 
 > **Note:** Vault's `bound_subject` is exact-match only and does not support
 > wildcards. To match every pod under `ns/chatbot/`, use `bound_claims` with
-> `bound_claims_type="glob"` as shown above. Adjust the pattern (e.g.
-> `chatbot-*`) to tighten matching.
+> `bound_claims_type="glob"` as shown above. The role payload is sent as
+> JSON via stdin because the CLI does not parse JSON object values supplied
+> inline (e.g. `bound_claims='{...}'` fails with
+> `expected a map, got 'string'`). Adjust the pattern (e.g. `chatbot-*`) to
+> tighten matching.
+
+### 9. Test the JWT login
+
+End-to-end smoke test: mint a SPIFFE JWT, decode its claims, then log in
+to the JWT auth method and confirm the returned token carries
+`chatbot-policy`.
+
+> **Prerequisite:** `auth/jwt/config` must point at the **issuer that signed
+> the JWT you're submitting**. For the actor (SPIFFE) flow this is the
+> Vault SPIFFE engine's discovery URL, **not** IBM Verify. Re-run
+> `vault write auth/jwt/config oidc_discovery_url="$ISSUER" bound_issuer="$ISSUER"`
+> using the same `$ISSUER` from step 4 if you previously pointed it at the
+> IdP. (See [Two-mount layout](#two-mount-layout) below for handling both
+> issuers simultaneously.)
+
+```bash
+# 1. Mint a short-lived SPIFFE JWT
+JWT=$(vault write -field=token spiffe/role/role-chatbot/mintjwt audience=vault)
+
+# 2. Decode and inspect the claims (sub, aud, iss must match the role)
+python3 -c "import sys,base64,json; p=sys.argv[1].split('.')[1]; \
+  p+='='*(-len(p)%4); \
+  print(json.dumps(json.loads(base64.urlsafe_b64decode(p)),indent=2))" "$JWT"
+
+# 3. Log in
+vault write auth/jwt/login role=chatbot-role jwt="$JWT"
+```
+
+A successful login returns:
+
+```
+Key                  Value
+---                  -----
+token                hvs.CAESI...
+token_duration       1h
+token_policies       ["chatbot-policy" "default"]
+token_meta_role      chatbot-role
+```
+
+#### Negative tests (optional but recommended)
+
+These should all **fail**, proving the role bindings are doing their job:
+
+```bash
+# Wrong audience: spiffe://example.org/ns/chatbot/test-pod with aud:not-vault
+BAD_AUD=$(vault write -field=token spiffe/role/role-chatbot/mintjwt audience=not-vault)
+vault write auth/jwt/login role=chatbot-role jwt="$BAD_AUD"
+# → invalid audience (aud) claim
+
+# Wrong namespace — create a second SPIFFE role outside ns/chatbot
+vault write spiffe/role/role-other \
+    template='{"sub": "spiffe://example.org/ns/other/test-pod"}' \
+    ttl=1m \
+    use_jti_claim=true
+
+JWT_OTHER=$(vault write -field=token spiffe/role/role-other/mintjwt audience=vault)
+
+# Inspect the claims to confirm sub is in ns/other/
+python3 -c "import sys,base64,json; p=sys.argv[1].split('.')[1]; \
+  p+='='*(-len(p)%4); \
+  print(json.dumps(json.loads(base64.urlsafe_b64decode(p)),indent=2))" "$JWT_OTHER"
+
+# Attempt login — must be rejected
+vault write auth/jwt/login role=chatbot-role jwt="$JWT_OTHER"
+# → claim "sub" does not match any associated bound claim values
+```
+
+Expected rejection:
+
+```
+Error writing data to auth/jwt/login: Error making API request.
+
+URL: PUT http://127.0.0.1:8300/v1/auth/jwt/login
+Code: 400. Errors:
+
+* error validating claims: claim "sub" does not match any associated bound claim values
+```
+
+This confirms the glob binding `spiffe://example.org/ns/chatbot/*` rejects
+any SPIFFE ID outside the `chatbot` namespace, even though the JWT itself
+is correctly signed by the same Vault SPIFFE issuer.
+
+#### Common failures
+
+| Error | Fix |
+|---|---|
+| `failed to verify id token signature` | `auth/jwt/config` points at the wrong issuer (e.g. IBM Verify when you're submitting a SPIFFE JWT). Repoint to the SPIFFE `$ISSUER`. |
+| `claim "sub" does not match associated bound claim values` | `sub` doesn't match the glob, **or** `bound_claims_type=glob` is missing. |
+| `invalid audience (aud) claim` | `audience=` passed to `mintjwt` ≠ `bound_audiences` on the role. |
+| `token is expired` | SPIFFE role TTL is 1m — re-mint. |
+
+<a id="two-mount-layout"></a>
+#### Handling both issuers (user OBO + actor SPIFFE)
+
+The OBO flow uses **two** different JWT issuers — IBM Verify for the user
+subject token and Vault SPIFFE for the chatbot actor token. A single
+`auth/jwt` mount can only point at one OIDC discovery URL, so enable two:
+
+```bash
+vault auth enable -path=jwt-user  jwt
+vault auth enable -path=jwt-actor jwt
+
+# User subject (IBM Verify)
+vault write auth/jwt-user/config \
+    oidc_discovery_url="https://test-demo-2020.verify.ibm.com/oidc/endpoint/default" \
+    bound_issuer="https://test-demo-2020.verify.ibm.com/oidc/endpoint/default"
+
+# Actor (Vault SPIFFE)
+vault write auth/jwt-actor/config \
+    oidc_discovery_url="$ISSUER" \
+    bound_issuer="$ISSUER"
+```
+
+Move `chatbot-role` under `jwt-actor/` and create a separate role under
+`jwt-user/` for the user subject token.
 
