@@ -10,14 +10,12 @@ It aims to solve a few problems:
 
 ## Architecture Diagram
 
-![OBO token exchange flow with SPIFFE](img/obo-flow-spiffe.png)
+![OBO token exchange flow with SPIFFE](img/architecture.png)
 
 ## Vault Configuration
 
-The steps below assume Vault Enterprise is already running and unsealed (see
-[`vault/vault_setup.sh`](vault/vault_setup.sh) for the container bootstrap),
-and that you authenticate via the **Kubernetes auth method** so each chatbot
-pod proves its own identity — no AppRole secret-id on disk.
+The steps below assume Vault Enterprise is already running and unsealed. Vault groups is already configured.
+
 
 ### Prerequisites — export environment
 
@@ -29,7 +27,7 @@ export VAULT_TOKEN=<root-or-admin-token>
 ## Bootstrapping the Agent Identity
 
 These steps establish the chatbot agent's machine identity in Vault. The
-agent is identified to Vault via Kubernetes auth (its projected
+agent is identified to Vault via JWT auth (its projected
 ServiceAccount token), and Vault then mints short-lived **SPIFFE JWTs**
 that downstream services can verify via OIDC.
 
@@ -46,35 +44,59 @@ path "spiffe/role/role-chatbot/*" {
 EOF
 ```
 
-### 2. Enable & configure the Kubernetes auth method
+### 2. Enabling JWT auth at path k8s-pod (per-pod identity)
 
-The pod's projected ServiceAccount token (rotated
-automatically by the kubelet) is what authenticates it to Vault.
+From Kubernetes 1.21 onwards, projected ServiceAccount tokens include extended `kubernetes.io` claims — such as `/kubernetes.io/pod/uid`, `/kubernetes.io/pod/name`, `/kubernetes.io/namespace`, and `/kubernetes.io/serviceaccount/name` — embedded directly in the JWT payload. This allows Vault to use the pod UID as a unique `user_claim`, giving each pod its own Vault entity rather than sharing one across all replicas.
 
 ```bash
-vault auth enable kubernetes
+vault auth enable -path=k8s-pod jwt
 
-vault write auth/kubernetes/config \
-    kubernetes_host="https://kubernetes.default.svc" \
-    kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+# Fetching cluster CA + issuer + JWKS via kubectl
+K8S_CA=$(kubectl get cm -n kube-system kube-root-ca.crt -o jsonpath='{.data.ca\.crt}')
+ISSUER=$(kubectl get --raw /.well-known/openid-configuration | jq -r '.issuer')
+
+# Configuring k8s pod JWT auth
+vault write auth/k8s-pod/config \
+  oidc_discovery_url="https://kubernetes.default.svc.cluster.local" \
+  oidc_discovery_ca_pem="$K8S_CA" \
+  bound_issuer="$ISSUER" \
+  default_role=chatbot-pod
 ```
 
-Bind a role to the chatbot ServiceAccount/namespace:
+Creating chatbot-pod role (user_claim = pod UID → unique entity per pod)
 
 ```bash
-vault write auth/kubernetes/role/chatbot \
-    bound_service_account_names=chatbot \
-    bound_service_account_namespaces=chatbot \
-    token_policies=chatbot-policy \
-    token_ttl=1h \
-    token_max_ttl=4h
+curl -sS -f -X POST \
+  -H "X-Vault-Token: ${VAULT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  "${VAULT_ADDR}/v1/auth/k8s-pod/role/chatbot-pod" \
+  -d '{
+    "role_type": "jwt",
+    "bound_audiences": ["https://kubernetes.default.svc.cluster.local"],
+    "user_claim": "/kubernetes.io/pod/uid",
+    "user_claim_json_pointer": true,
+    "bound_claims_type": "glob",
+    "bound_claims_json_pointer": true,
+    "bound_claims": {
+      "/kubernetes.io/namespace": "chatbot",
+      "/kubernetes.io/serviceaccount/name": "chatbot"
+    },
+    "claim_mappings": {
+      "/kubernetes.io/pod/name": "pod_name",
+      "/kubernetes.io/pod/uid": "pod_uid",
+      "/kubernetes.io/namespace": "namespace",
+      "/kubernetes.io/serviceaccount/name": "service_account_name"
+    },
+    "token_policies": ["chatbot-policy"],
+    "token_ttl": "10m"
+  }' > /dev/null
 ```
 
 Capture the mount accessor — the SPIFFE template needs it to read pod
 metadata that Kubernetes auth attaches to the entity alias:
 
 ```bash
-export K8S_ACCESSOR=$(vault auth list -format=json | jq -r '.["kubernetes/"].accessor')
+JWT_ACCESSOR=$(vault auth list -format=json | jq -r '."k8s-pod/".accessor')
 ```
 
 ### 3. Enable the SPIFFE secrets engine
@@ -101,8 +123,8 @@ metadata, producing `spiffe://example.org/ns/<namespace>/<pod-name>`.
 
 ```bash
 vault write spiffe/role/role-chatbot \
-    template='{"sub": "spiffe://example.org/ns/{{identity.entity.aliases.'"$K8S_ACCESSOR"'.metadata.service_account_namespace}}/{{identity.entity.aliases.'"$K8S_ACCESSOR"'.metadata.pod_name}}"}' \
-    ttl=1m \
+    template="{\"sub\": \"spiffe://demo.local/ns/{{identity.entity.aliases.${JWT_ACCESSOR}.metadata.namespace}}/pod/{{identity.entity.aliases.${JWT_ACCESSOR}.metadata.pod_name}}\"}" \
+    ttl=5m \
     use_jti_claim=true
 ```
 
@@ -127,24 +149,70 @@ Lets Vault accept user identity tokens from the IdP (IBM Verify) so the
 chatbot can perform on-behalf-of token exchange.
 
 ```bash
-vault auth enable jwt
+vault auth enable -path=jwt-actor jwt
+git
+vault write auth/jwt-actor/config \
+    oidc_discovery_url="https://${VERIFY_DOMAIN}/oidc/endpoint/default" \
+    bound_issuer="https://${VERIFY_DOMAIN}/oauth2"
+    
+```
 
-vault write auth/jwt/config \
-    oidc_discovery_url="https://test-demo-2020.verify.ibm.com/oidc/endpoint/default" \
-    bound_issuer="https://test-demo-2020.verify.ibm.com/oidc/endpoint/default"
-
-cat <<'EOF' | vault write auth/jwt/role/chatbot-role -
-{
-  "role_type": "jwt",
-  "policies": "chatbot-policy",
-  "user_claim": "sub",
-  "bound_audiences": "vault",
-  "bound_claims_type": "glob",
-  "bound_claims": { "sub": "spiffe://example.org/ns/chatbot/*" },
-  "token_ttl": "1h",
-  "token_max_ttl": "4h"
+Create broker policy. This will allow the authenticated pod to access certain credential in Vault.
+```sh 
+vault policy write broker-policy - <<'EOF'
+path "database/creds/role-broker-readonly" {
+  capabilities = ["read"]
+}
+path "auth/jwt-actor/login" {
+  capabilities = ["update"]
 }
 EOF
+```
+This role will map your group --> vault policy and make sure you have specific claims before allowed to performed login.
+
+### Configure Vault External Group
+
+An external group links a group from your IdP (IBM Verify) to a Vault policy. When a user logs in and their JWT contains a matching `groups` claim, Vault automatically assigns the policy attached to that external group.
+
+```sh
+# 1. Get the accessor for the jwt-actor auth mount
+JWT_ACTOR_ACCESSOR=$(vault auth list -format=json | jq -r '."jwt-actor/".accessor')
+
+# 2. Create the external group and attach the broker policy
+GROUP_ID=$(vault write -field=id identity/group \
+    name="demo-balance-readers" \
+    type="external" \
+    policies="broker-policy" \
+    metadata=description="IBM Verify users with demo.balance.read scope")
+
+# 3. Create a group alias that maps the IdP group name to the Vault group
+#    The 'name' must match the value in the 'groups' claim of the JWT
+vault write identity/group-alias \
+    name="demo-balance-readers" \
+    mount_accessor="${JWT_ACTOR_ACCESSOR}" \
+    canonical_id="${GROUP_ID}"
+```
+
+Now any JWT with `"groups": ["demo-balance-readers"]` that passes the `chatbot-role` bound claims check will automatically inherit `broker-policy`, granting access to `database/creds/role-broker-readonly`.
+
+```sh
+curl -s -X PUT "${VAULT_ADDR}/v1/auth/jwt-actor/role/chatbot-role" \
+  -H "X-Vault-Token: ${VAULT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"role_type\": \"jwt\",
+    \"bound_audiences\": [\"vault\"],
+    \"group_claim\": \"groups\",
+    \"bound_claims_type\": \"string\",
+    \"bound_claims\": {
+      \"scope\": \"demo.balance.read\"
+    },
+    \"claim_mappings\": {
+      \"name\": \"name\",
+      \"aud\": \"aud\"
+    },
+    \"token_ttl\": \"5m\"
+  }" | jq .
 ```
 
 > **Note:** Vault's `bound_subject` is exact-match only and does not support
