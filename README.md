@@ -16,6 +16,7 @@ It aims to solve a few problems:
 
 The steps below assume Vault Enterprise is already running and unsealed. Vault groups is already configured.
 
+This example uses [vault agent injector](https://developer.hashicorp.com/vault/docs/deploy/kubernetes/injector) to inject jwt into each pod.
 
 ### Prerequisites — export environment
 

@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chatbot
+  namespace: chatbot
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-config
+  namespace: chatbot
+data:
+  BROKER_URL: "http://broker.broker.svc.cluster.local:8000"
+  SPIFFE_JWT_PATH: "/var/run/spiffe/svid"
+  LLM_BASE_URL: "http://host.docker.internal:11434/v1"
+  LLM_MODEL: "llama3.1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+  namespace: chatbot
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: agent }
+  template:
+    metadata:
+      labels: { app: agent }
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/auth-path: "auth/k8s-pod"
+        vault.hashicorp.com/role: "chatbot-pod"
+        vault.hashicorp.com/agent-inject-secret-svid: "spiffe/role/role-chatbot/mintjwt"
+        vault.hashicorp.com/agent-inject-template-svid: |
+          {{ with secret "spiffe/role/role-chatbot/mintjwt" "audience=vault" (printf "pod_name=%s" (env "HOSTNAME")) }}{{ .Data.token }}{{ end }}
+        vault.hashicorp.com/agent-inject-file-svid: "svid"
+        vault.hashicorp.com/secret-volume-path-svid: "/var/run/spiffe"
+
+    spec:
+      serviceAccountName: chatbot
+      volumes: []
+      containers:
+        - name: agent
+          image: agentic-vault-demo/agent:dev
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: agent-config }
+          # US2 invariant: agent receives ONLY its own OAuth client credential.
+          # No DB creds, no IdP web-client secret, no cookie key.
+          env:
+            - name: VERIFY_DOMAIN
+              valueFrom: { secretKeyRef: { name: ibm-verify, key: VERIFY_DOMAIN } }
+            - name: APP_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: ibm-verify, key: APP_CLIENT_ID } }
+            - name: APP_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: ibm-verify, key: APP_CLIENT_SECRET } }
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "50m",  memory: "256Mi" }
+            limits:   { cpu: "1000m", memory: "1Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent
+  namespace: chatbot
+spec:
+  selector: { app: agent }
+  ports:
+    - port: 8000
+      targetPort: 8000
