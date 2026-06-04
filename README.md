@@ -8,6 +8,8 @@ It aims to solve a few problems:
 
     2. Traceability, Accountability and Auditability of the Agent
 
+For setup of vault refer to ./SETUP.MD
+
 ## Architecture Diagram
 
 ![OBO token exchange flow with SPIFFE](img/architecture.png)
