@@ -10,8 +10,8 @@ export PRI_ADDR="http://$VM_PRIVATE_IP_ADDR:8200"
 setupvault() {
   echo "Setting up Vault"
 
-  sudo mkdir /vault
-  sudo mkdir /vault/{config,data}
+  sudo mkdir $VAULT_PATH
+  sudo mkdir $VAULT_PATH/{config,data}
 
   # Run Vault in a Docker Container Server
   sudo tee /vault/config/vault-server.hcl <<EOF
