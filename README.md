@@ -1,5 +1,7 @@
 # Agentic Control Plane
 
+> Note: For setup of vault refer to [SETUP.md](./SETUP.md)
+
 **Description**: This github repository explore how you can use HashiCorp Vault and IdP in an OBO Token Exchange flow.
 
 It aims to solve a few problems:
@@ -8,7 +10,6 @@ It aims to solve a few problems:
 
     2. Traceability, Accountability and Auditability of the Agent
 
-For setup of vault refer to ./SETUP.MD
 
 ## Architecture Diagram
 
